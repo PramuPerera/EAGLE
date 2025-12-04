@@ -357,19 +357,19 @@ if __name__ == "__main__":
         "--total-token",
         type=int,
         default=60,
-        help="total-token = The total number of drafted tokens in the tree + 1",
+        help="The maximum number of new generated tokens.",
     )
     parser.add_argument(
         "--depth",
         type=int,
         default=5,
-        help="depth = The maximum number of draft length - 1",
+        help="The maximum number of new generated tokens.",
     )
     parser.add_argument(
         "--top-k",
         type=int,
         default=10,
-        help="The maximum number of drafted tokens in each layer.",
+        help="The maximum number of new generated tokens.",
     )
 
     parser.add_argument(

@@ -1,5 +1,7 @@
 import argparse
 import deepspeed
+from itertools import chain
+
 
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/llama31chat/8B/')
@@ -19,11 +21,11 @@ with open(deepspeed_config) as f:
     ds_config = json.load(f)
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
-    "num_epochs": 40,
-    "num_workers": 2,
+    "num_epochs": 100,
+    "num_workers": 1,
     "max_len": 2048,
     "config_path": "config.json",
-    "gradient_checkpoint": True
+    "gradient_checkpoint": False
 }
 
 from safetensors import safe_open
@@ -39,12 +41,13 @@ from accelerate.utils import set_seed
 set_seed(0)
 from cnets import Model
 from configs import EConfig
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from datasets import Dataset as Dataset0
 from tqdm import tqdm
 # import accelerate
 import numpy as np
@@ -55,106 +58,31 @@ from transformers import PreTrainedTokenizerBase, get_linear_schedule_with_warmu
 def build_dataset_rank(
         tokenizer, datapath
 ):
-
-    ds = load_dataset('json', data_files=datapath)
-    ds = ds['train']
+    ds  = concatenate_datasets([Dataset0.from_file(f'/mnt/efs/people/yawenwuu/projects/Qwen2.5-Coder/finetuning/sft/dataset/code_edit_efs/context/hunks_v2/merged_output_part_0_39_mixed_pc_non_pc_dedup_threshold_09_chat_tokenized_v2_user_masked_with_codeediteval_bugbash/train_packed_max_len_8192/data-000{"{:02d}".format(i)}-of-00015.arrow') for i in range(1,14)])
+    #ds = load_dataset('json', data_files=datapath)
+    #ds = ds['train']
     ds = ds.shuffle(seed=42)
     ds1 = ds
     original_columns1 = ds1.column_names
     num_proc = 8
 
-    def preprocess_function(examples):
+    def preprocess_function(data):
         new_examples = {
             "attention_mask": [],
             "input_ids": [],
             "loss_mask": []
         }
-        for i in range(len(examples['id'])):
-            messages = [
-                {"role": "system",
-                 "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-            ]
-            convroles = ["user", "assistant"]
-            roles = {"human": "user", "gpt": "assistant"}
-            source = examples['conversations'][i]
-            if not source:
-                continue
-            if roles[source[0]["from"]] != "user":
-                # Skip the first one if it is not from human
-                source = source[1:]
-            for j, sentence in enumerate(source):
-                role = roles[sentence["from"]]
-                assert role == convroles[j % 2], f"{i}"
-                # if sentence["from"]=="gpt":
-                #     sentence["value"]=" "+sentence["value"]
-                messages.append(
-                    {"role": role, "content": sentence["value"]}
-                )
-            conversation = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-            if not tokenizer.pad_token_id:
-                tokenizer.pad_token_id = tokenizer.unk_token_id
-
-            input_ids = tokenizer(
-                conversation,
-                return_tensors="pt",
-                add_special_tokens=False,
-            ).input_ids[0]
-            # filtering out the samples which is longer than max_len
-            if len(input_ids) > train_config["max_len"]:
-                continue
-            loss_mask = torch.ones_like(input_ids)
-            # print(i)
-
-            sep = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
-            total_len = len(input_ids)
-
-            sep2 = "<|eot_id|><|start_header_id|>user<|end_header_id|>"
-            turns = conversation.split(sep2)
-
-            turns[1] = turns[0] + sep2 + turns[1]
-            turns = turns[1:]
-
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
-
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-                # Ignore the user instructions
-                if i == 0:
-                    loss_mask[cur_len: cur_len + instruction_len - 2] = 0
-                else:
-                    loss_mask[cur_len - 3: cur_len + instruction_len + 1] = 0
-                cur_len += turn_len
-                if i != 0:
-                    cur_len += 3
-                # cur_len+=2
-
-                # if i != 0 and not tokenizer.legacy:
-                #     # The legacy and non-legacy modes handle special tokens differently
-                #     cur_len -= 1
-
-            loss_mask[cur_len:] = 0
-            attention_mask = torch.ones_like(loss_mask)
-
-            # new_examples["conversation"].append(conversation)
-            new_examples["input_ids"].append(input_ids[None, :])
-            new_examples["loss_mask"].append(loss_mask[None, :])
-            new_examples["attention_mask"].append(attention_mask[None, :])
+        for i in range(len(data["input_ids"])):
+            if  len(torch.tensor(data["input_ids"][i][0]))<train_config["max_len"]:
+                input_ids=torch.tensor(data["input_ids"][i][0])# corch.tensor([data["input_ids"][i][:train_config["max_len"]]])
+                length = len(input_ids)
+                attention_mask =torch.tensor([1] * length)
+                loss_mask = torch.tensor(list(torch.where(torch.tensor(data['label'][i][0])!=-1000, 1, 0).numpy()))
+                assert input_ids.shape == loss_mask.shape
+                # new_examples["conversation"].append(conversation)
+                new_examples["input_ids"].append(input_ids[None, :])
+                new_examples["loss_mask"].append(loss_mask[None, :])
+                new_examples["attention_mask"].append(attention_mask[None, :])
 
         return new_examples
 
@@ -203,8 +131,8 @@ class DataCollatorWithPadding:
 
 
 tokenizer = AutoTokenizer.from_pretrained(args.basepath)
-traindataset = build_dataset_rank(tokenizer, args.trainpath)
-testdataset = build_dataset_rank(tokenizer, args.testpath)
+traindataset = build_dataset_rank(tokenizer, None)
+traindataset, testdataset = torch.utils.data.random_split(traindataset, [0.95, 0.05])
 
 config = EConfig.from_pretrained(train_config["config_path"])
 model = Model(config, ds_config, train_config, path=args.basepath, load_emb=True, load_head=True)
@@ -217,7 +145,7 @@ num_epochs = train_config["num_epochs"]
 
 model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
                                                      model=model,
-                                                     model_parameters=model.parameters(),
+                                                     model_parameters=model.parameters(),#chain(model.midlayer.parameters(), model.norm.parameters(), model.fc.parameters(), model.l1smooth.parameters(), model.embed_tokens.parameters(), model.lm_head.parameters()), #model.parameters(),
                                                      )
 
 global_rank = deepspeed.comm.get_rank()
@@ -227,7 +155,7 @@ if global_rank == 0:
     import wandb
 
     wandb.login(key="")
-    wandb.init(project="l382", entity="yuhui-li", config=ds_config)
+    wandb.init(project="ess", entity="pramudi", config=ds_config)
 
 os.makedirs(args.savedir, exist_ok=True)
 
@@ -346,6 +274,6 @@ for epoch in range(start_epoch, num_epochs):
     # clear out the redundance cahce after each step
     torch.cuda.empty_cache()
 
-    model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
+    #model_engine.save_16bit_model(f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)
     if epoch % 10 == 0:
-        deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}")
+        deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.savedir}/state_{epoch}", exclude_frozen_parameters=True)

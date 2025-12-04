@@ -4,7 +4,7 @@ parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
 parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--lr', type=float, default=3e-5)
-parser.add_argument('--bs', type=int, default=4)
+parser.add_argument('--bs', type=int, default=1)
 parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
 parser.add_argument('--tmpdir', type=str, default='0')
 parser.add_argument('--cpdir', type=str, default='0')
@@ -19,7 +19,7 @@ train_config = {
     "num_epochs": 20,
     # Depending on your data and model size, the larger the model, the higher the sample efficiency. We recommend setting it between 20-40.
     "num_warmup_steps": 2000,
-    "total_steps": 800000,
+    "total_steps": 5000,
     "p_w": 0.1,
     "v_w": 1.0,
     "head_w": 0.1,
@@ -31,13 +31,13 @@ train_config = {
     "mean": 0.0,
     "std": 0.2,
     "residual": "true,norm",
-    "max_len": 2048,
+    "max_len": 4096,
     # During training, truncating the training sequences means that the larger the setting, the more training data is used, and the better the effect, but it also consumes more VRAM.
     "config_path": args.configpath,
     "b1": 0.9,
     "b2": 0.95,
     "grad_clip": 0.5,
-    "save_freq": 5
+    "save_freq": 1
 }
 import json
 from safetensors import safe_open
@@ -49,11 +49,15 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from datetime import timedelta
+from accelerate import InitProcessGroupKwargs
 
+# Create the custom configuration
+process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=5400))
 set_seed(0)
 accelerator = Accelerator(mixed_precision='bf16',
-                          gradient_accumulation_steps=train_config["gradient_accumulation_steps"])
-from ..model.cnets1 import Model
+                          gradient_accumulation_steps=train_config["gradient_accumulation_steps"], kwargs_handlers=[process_group_kwargs])
+from ..model.cnets import Model
 from ..model.configs import EConfig
 from typing import Any, Dict, List
 
@@ -63,11 +67,11 @@ from tqdm import tqdm
 # import accelerate
 import numpy as np
 from transformers import get_linear_schedule_with_warmup, AutoConfig
-
+print('STARTING==========================================')
 if accelerator.is_main_process:
     import wandb
 
-    wandb.init(project="ess", entity="yuhui-li", config=train_config)
+    wandb.init(project="ess", entity="pramudi", config=train_config)
 
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 
@@ -87,8 +91,8 @@ except:
     with open(os.path.join(args.basepath, "pytorch_model.bin.index.json"), "r") as f:
         index_json = json.loads(f.read())
         head_path = index_json["weight_map"]["lm_head.weight"]
-    weights = torch.load(os.path.join(args.basepath, head_path))
-    tensor = weights["lm_head.weight"].float()
+    tensor = torch.load(os.path.join(args.basepath, head_path))
+    tensor = tensor["lm_head.weight"].float()
 
 head.weight.data = tensor
 head.eval()
@@ -141,21 +145,35 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, index):
         # try:
-        data = torch.load(self.data[index])
+        data = torch.load(self.data[index], weights_only=False)
+
+
+
         new_data = {}
-        hidden_state = data['hidden_state'][:train_config["max_len"]][None, :]
-        input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-        loss_mask = data["loss_mask"][:train_config["max_len"]][None, :]
+        hidden_state = torch.tensor(data['hidden_state'][:train_config["max_len"]][None, :])
+        input_ids = torch.tensor(data['input_ids'][:train_config["max_len"]][None, :])
+        label = torch.tensor(data["label"][:train_config["max_len"]][None, :])
 
 
+        #input_ids = input_ids[0]
+        #label = label[0]
+
+
+        loss_mask = list(torch.where(torch.tensor(label.squeeze())!=-100, 1, 0).numpy())
+
+
+
+
+        print('ip', input_ids.shape)
+        print('hs', hidden_state.shape)
+        print('lbl', label.shape)
         length = hidden_state.shape[1]
         # length_q = data['query_ids'].shape[1]
         attention_mask = [1] * length
-        loss_mask = loss_mask[0].tolist()
         loss_mask[-1] = 0
-
         input_ids_target = input_ids[:, 1:]
         zeropadding = torch.tensor([[0]])
+
         input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
 
         target = hidden_state[:, 1:, :]
@@ -197,15 +215,13 @@ class DataCollatorWithPadding:
         batch_target = torch.cat([self.paddingtensor(item['target'], max_length) for item in features])
         batch_loss_mask = torch.tensor(
             [item['loss_mask'] + [0] * (max_length - len(item['loss_mask'])) for item in features])
-        batch_attention_mask = torch.tensor(
-            [item['attention_mask'] + [0] * (max_length - len(item['attention_mask'])) for item in features])
+
         # batch_loss_mask = torch.ones_like(batch_loss_mask)
         # batch_attention_mask=torch.ones_like(batch_attention_mask)
         batch = {
             "input_ids": batch_input_ids,
             "hidden_states": batch_hidden_states,
             "target": batch_target,
-            "attention_mask": batch_attention_mask,
             "loss_mask": batch_loss_mask,
         }
         return batch
@@ -320,7 +336,7 @@ if accelerator.is_main_process:
 
 config = EConfig.from_pretrained(train_config["config_path"])
 model = Model(config, load_emb=True, path=args.basepath)
-
+print(model)
 criterion = nn.SmoothL1Loss(reduction="none")
 optimizer = optim.AdamW(model.parameters(), lr=train_config["lr"], betas=(train_config["b1"], train_config["b2"]))
 
@@ -348,11 +364,11 @@ for epoch in range(num_epochs + 1):
     epoch_loss = 0
     num_batches = 0
     model.train()
+    accelerator.save_state(output_dir=f"{args.cpdir}/state_{000}")
     for batch_idx, data in enumerate(tqdm(train_loader)):
-
         with accelerator.accumulate(model):
             optimizer.zero_grad()
-            predict = model(data["hidden_states"], input_ids=data["input_ids"], attention_mask=data["attention_mask"])
+            predict = model(data["hidden_states"], input_ids=data["input_ids"])
             with torch.no_grad():
                 target_head = head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
@@ -404,15 +420,19 @@ for epoch in range(num_epochs + 1):
         print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
         print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
         wandb.log({"train/epochacc": correct / total, "train/epochloss": epoch_loss})
-
-    if (epoch + 1) % train_config["save_freq"]:
+    if accelerator.is_local_main_process:
+        print('Test Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
+        print('Test Accuracy: {:.2f}%'.format(100 * correct / total))
+        wandb.log({"test/epochacc": correct / total, "test/epochloss": epoch_loss})
+        accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
+        print('saving state')
+    if True:#(epoch + 1) % train_config["save_freq"]:
         top_3acc = [0 for _ in range(3)]
         correct = 0
         total = 0
         epoch_loss = 0
         num_batches = 0
         model.eval()
-
         k_acc = [[] for i in range(5)]
         for batch_idx, data in enumerate(tqdm(test_loader)):
             with torch.no_grad():
@@ -420,8 +440,7 @@ for epoch in range(num_epochs + 1):
                     acces = getkacc(model, data, head, max_length=5)
                     for i in range(len(acces)):
                         k_acc[i].append(acces[i])
-                predict = model(data["hidden_states"], input_ids=data["input_ids"],
-                                attention_mask=data["attention_mask"])
+                predict = model(data["hidden_states"], input_ids=data["input_ids"],)
                 target_head = head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
                 target_p = target_p.detach()
@@ -467,3 +486,4 @@ for epoch in range(num_epochs + 1):
             print('Test Accuracy: {:.2f}%'.format(100 * correct / total))
             wandb.log({"test/epochacc": correct / total, "test/epochloss": epoch_loss})
             accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")
+            print('saving state')

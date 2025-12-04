@@ -323,12 +323,14 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
             attn_output = self.o_proj(attn_output)
+
         if not output_attentions:
             attn_weights = None
 
@@ -421,8 +423,10 @@ class LlamaDecoderLayer(nn.Module):
         """
 
         residual = hidden_states
+
         if self.index != 0:
             hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -433,11 +437,13 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -565,12 +571,15 @@ class Model(nn.Module):
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
+
         with torch.no_grad():
             inputs_embeds = self.embed_tokens(input_ids)
             # inputs_embeds = inputs_embeds.detach()
+
         # if std is not None:
         #     noise = torch.randn(inputs_embeds.size(),device=inputs_embeds.device) * std
         #     inputs_embeds=inputs_embeds+noise
+
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
@@ -600,8 +609,10 @@ class Model(nn.Module):
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
         h = torch.cat((inputs_embeds, hidden_states), dim=-1)
         hidden_states = self.fc(h)
+
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
+
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -634,11 +645,13 @@ class Model(nn.Module):
                 )
 
             hidden_states = layer_outputs[0]
+
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
         if use_cache:
             return hidden_states, next_decoder_cache
+
         return hidden_states
 
     def reset_kv(self):
